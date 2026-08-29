@@ -1,0 +1,88 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() { return request.auth != null; }
+    function myRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function myEmail() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.email;
+    }
+    function isManager() { return isSignedIn() && myRole() in ['owner', 'manager']; }
+    function isEmployee() { return isSignedIn() && myRole() == 'employee'; }
+    function isGuest() { return isSignedIn() && myRole() == 'guest'; }
+
+    function sharePermission(sheetId) {
+      let shares = get(/databases/$(database)/documents/sheets/$(sheetId)).data.sharedWith;
+      return (isGuest() && myEmail() in shares) ? shares[myEmail()] : null;
+    }
+    function isSharedViewer(sheetId) { return sharePermission(sheetId) in ['view', 'edit']; }
+    function isSharedEditor(sheetId) { return sharePermission(sheetId) == 'edit'; }
+
+    function isAssigned(sheetId) {
+      return isManager() ||
+        sheetId == 'daily-report' ||
+        (isEmployee() &&
+          request.auth.uid in get(/databases/$(database)/documents/sheets/$(sheetId)).data.assignedEmployees) ||
+        isSharedViewer(sheetId);
+    }
+    function isIdentitySheet(sheetId) {
+      return sheetId == 'daily-report' || sheetId == 'attendance';
+    }
+
+    // one-time "has an Owner been created yet" flag — publicly readable
+    // so the sign-up screen can check it before anyone logs in
+    match /meta/setup {
+      allow read: if true;
+      allow write: if isSignedIn() &&
+        (!exists(/databases/$(database)/documents/meta/setup) ||
+         get(/databases/$(database)/documents/meta/setup).data.ownerCreated == false) &&
+        request.resource.data.ownerCreated == true;
+    }
+    match /meta/sheetsSeeded {
+      allow read: if true;
+      allow write: if isManager();
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if request.auth.uid == uid && (
+        (request.resource.data.role in ['owner', 'manager'] &&
+          (!exists(/databases/$(database)/documents/meta/setup) ||
+           get(/databases/$(database)/documents/meta/setup).data.ownerCreated == false)) ||
+        (isManager() && request.resource.data.role == 'employee') ||
+        // guest self-signup is always open — grants no access on its own
+        request.resource.data.role == 'guest'
+      );
+      allow update: if isSignedIn() && (request.auth.uid == uid || isManager());
+      allow delete: if isManager();
+    }
+
+    match /sheets/{sheetId} {
+      allow read: if isAssigned(sheetId);
+      allow write: if isManager();
+
+      match /rows/{rowId} {
+        allow read: if isManager() ||
+          (!isIdentitySheet(sheetId) && isAssigned(sheetId)) ||
+          (isIdentitySheet(sheetId) && isEmployee() && resource.data._ownerUid == request.auth.uid);
+        allow create, update: if isManager() ||
+          (!isIdentitySheet(sheetId) && isEmployee() &&
+            request.auth.uid in get(/databases/$(database)/documents/sheets/$(sheetId)).data.assignedEmployees) ||
+          (!isIdentitySheet(sheetId) && isSharedEditor(sheetId)) ||
+          (isIdentitySheet(sheetId) && isEmployee() && request.resource.data._ownerUid == request.auth.uid);
+        allow delete: if isManager() ||
+          (!isIdentitySheet(sheetId) && isEmployee() &&
+            request.auth.uid in get(/databases/$(database)/documents/sheets/$(sheetId)).data.assignedEmployees) ||
+          (!isIdentitySheet(sheetId) && isSharedEditor(sheetId)) ||
+          (isIdentitySheet(sheetId) && isEmployee() && resource.data._ownerUid == request.auth.uid);
+      }
+    }
+
+    match /bankDetails/{doc} {
+      allow read: if isSignedIn();
+      allow write: if isManager();
+    }
+  }
+}
