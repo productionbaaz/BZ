@@ -183,14 +183,30 @@ async function getUserDoc(uidVal) {
   return snap.exists() ? snap.data() : null;
 }
 
+/* Creates any missing default sheets AND patches in fields that got
+   added to the schema after this project's sheets were first created
+   (sharedWith, publicAccess). This runs every time a manager logs in —
+   cheap and fully idempotent — so an older project self-heals instead
+   of silently failing permission checks that assume those fields
+   exist. This was a real bug: an employee's entire sheet list would
+   fail to load because older sheet documents were missing these two
+   fields, which the security rules read on every sheet in the list. */
 async function ensureSeeded() {
-  const metaSnap = await getDoc(doc(db, 'meta', 'sheetsSeeded'));
-  if (metaSnap.exists()) return;
   await Promise.all(Object.keys(SHEET_DEFS).map(async (id) => {
     const def = SHEET_DEFS[id];
     const sheetSnap = await getDoc(doc(db, 'sheets', id));
     if (!sheetSnap.exists()) {
-      await setDoc(doc(db, 'sheets', id), { name: def.name, icon: def.icon, assignedEmployees: [], columns: def.columns });
+      await setDoc(doc(db, 'sheets', id), {
+        name: def.name, icon: def.icon, assignedEmployees: [],
+        sharedWith: {}, publicAccess: null, columns: def.columns
+      });
+    } else {
+      const data = sheetSnap.data();
+      const patch = {};
+      if (data.sharedWith === undefined) patch.sharedWith = {};
+      if (data.publicAccess === undefined) patch.publicAccess = null;
+      if (data.assignedEmployees === undefined) patch.assignedEmployees = [];
+      if (Object.keys(patch).length) await setDoc(doc(db, 'sheets', id), patch, { merge: true });
     }
   }));
   await setDoc(doc(db, 'meta', 'sheetsSeeded'), { done: true });
@@ -242,6 +258,9 @@ export const firebasedb = {
       await signOut(auth);
       throw new Error('No matching account found.');
     }
+    // self-heals any sheets missing newer fields (sharedWith, publicAccess) —
+    // cheap and safe to run on every manager login
+    try { await ensureSeeded(); } catch (err) { console.error('Sheet self-heal failed:', err); }
     return { user: publicUser(cred.user.uid, data) };
   },
 
